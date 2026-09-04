@@ -6,6 +6,7 @@ whatever new video files it exported.
 Usage:
     python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --size 7
     python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --input clip.mp4 --size 7
+    python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --size 7 --max-height 720 --merge-audio
 """
 
 import argparse
@@ -14,7 +15,7 @@ import subprocess
 import sys
 
 LOSSLESSCUT_EXE = (
-    r"C:\Program Files\LosslessCut\LosslessCut.exe"  # adjust to your install
+    r"C:\Backups\Utilities\LosslessCut-win-x64\LosslessCut.exe"  # adjust to your install
 )
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
@@ -26,7 +27,12 @@ def snapshot(dir_path: str) -> set:
 
 
 def compress(
-    path: str, out_dir: str, target_mb: float, margin: float, max_height: int = None
+    path: str,
+    out_dir: str,
+    target_mb: float,
+    margin: float,
+    max_height: int = None,
+    merge_audio: bool = False,
 ):
     base, ext = os.path.splitext(os.path.basename(path))
     out_path = os.path.join(out_dir, f"{base}_compressed{ext}")
@@ -43,6 +49,8 @@ def compress(
     ]
     if max_height:
         cmd += ["--max-height", str(max_height)]
+    if merge_audio:
+        cmd += ["--merge-audio"]
     subprocess.run(cmd, check=True)
 
 
@@ -52,6 +60,7 @@ def main(
     target_mb: float,
     margin: float,
     max_height: int = None,
+    merge_audio: bool = False,
 ):
     before = snapshot(export_dir)
 
@@ -76,7 +85,14 @@ def main(
     os.makedirs(out_dir, exist_ok=True)
 
     for name in new_files:
-        compress(os.path.join(export_dir, name), out_dir, target_mb, margin, max_height)
+        compress(
+            os.path.join(export_dir, name),
+            out_dir,
+            target_mb,
+            margin,
+            max_height,
+            merge_audio,
+        )
 
     print(f"\nDone. {len(new_files)} file(s) compressed into {out_dir}")
 
@@ -108,6 +124,18 @@ if __name__ == "__main__":
         default=None,
         help="Cap output height in pixels (e.g. 720), passed through to compress_to_size.py",
     )
+    parser.add_argument(
+        "--merge-audio",
+        action="store_true",
+        help="Mix all audio tracks into one before encoding, passed through to compress_to_size.py",
+    )
     args = parser.parse_args()
 
-    main(args.losslesscut_dir, args.input, args.size, args.margin, args.max_height)
+    main(
+        args.losslesscut_dir,
+        args.input,
+        args.size,
+        args.margin,
+        args.max_height,
+        args.merge_audio,
+    )
