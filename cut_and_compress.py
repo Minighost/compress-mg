@@ -7,6 +7,7 @@ Usage:
     python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --size 7
     python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --input clip.mp4 --size 7
     python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --size 7 --max-height 720 --merge-audio
+    python cut_and_compress.py --losslesscut-dir "D:\Clips\cuts" --size 7 --merge-audio --normalize-audio
 """
 
 import argparse
@@ -14,9 +15,7 @@ import os
 import subprocess
 import sys
 
-LOSSLESSCUT_EXE = (
-    r"C:\Backups\Utilities\LosslessCut-win-x64\LosslessCut.exe"  # adjust to your install
-)
+LOSSLESSCUT_EXE = r"C:\Backups\Utilities\LosslessCut-win-x64\LosslessCut.exe"  # adjust to your install
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
 COMPRESS_SCRIPT = os.path.join(os.path.dirname(__file__), "compress_to_size.py")
@@ -33,6 +32,7 @@ def compress(
     margin: float,
     max_height: int = None,
     merge_audio: bool = False,
+    normalize_audio: bool = False,
 ):
     base, ext = os.path.splitext(os.path.basename(path))
     out_path = os.path.join(out_dir, f"{base}_compressed{ext}")
@@ -51,6 +51,8 @@ def compress(
         cmd += ["--max-height", str(max_height)]
     if merge_audio:
         cmd += ["--merge-audio"]
+    if normalize_audio:
+        cmd += ["--normalize-audio"]
     subprocess.run(cmd, check=True)
 
 
@@ -61,6 +63,7 @@ def main(
     margin: float,
     max_height: int = None,
     merge_audio: bool = False,
+    normalize_audio: bool = False,
 ):
     before = snapshot(export_dir)
 
@@ -92,9 +95,11 @@ def main(
             margin,
             max_height,
             merge_audio,
+            normalize_audio,
         )
 
     print(f"\nDone. {len(new_files)} file(s) compressed into {out_dir}")
+    os.startfile(out_dir)
 
 
 if __name__ == "__main__":
@@ -129,6 +134,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Mix all audio tracks into one before encoding, passed through to compress_to_size.py",
     )
+    parser.add_argument(
+        "--normalize-audio",
+        action="store_true",
+        help="Loudness-normalize tracks before/after mixing, passed through to compress_to_size.py "
+        "(only applies with --merge-audio)",
+    )
     args = parser.parse_args()
 
     main(
@@ -138,4 +149,5 @@ if __name__ == "__main__":
         args.margin,
         args.max_height,
         args.merge_audio,
+        args.normalize_audio,
     )

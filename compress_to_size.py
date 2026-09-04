@@ -6,6 +6,8 @@ Usage:
     python compress_to_size.py input.mp4 output.mp4 --size 7
     python compress_to_size.py input.mp4 output.mp4 --size 7 --margin 0.95
     python compress_to_size.py input.mp4 output.mp4 --size 7 --merge-audio
+    python compress_to_size.py input.mp4 output.mp4 --size 7 --merge-audio --normalize-audio
+    python compress_to_size.py input.mp4 output.mp4 --size 7 --open-dir
 """
 
 import argparse
@@ -68,7 +70,7 @@ def count_audio_streams(input_path: str) -> int:
     return len([line for line in result.stdout.strip().splitlines() if line])
 
 
-def merge_audio_tracks(input_path: str) -> str:
+def merge_audio_tracks(input_path: str, normalize: bool = False) -> str:
     """Mix all audio tracks in the file down to one. Returns the original
     path unchanged if there's nothing to merge (0 or 1 audio streams)."""
     n = count_audio_streams(input_path)
@@ -77,7 +79,17 @@ def merge_audio_tracks(input_path: str) -> str:
 
     base, ext = os.path.splitext(input_path)
     mixed_path = f"{base}_mixed{ext}"
-    inputs = "".join(f"[0:a:{i}]" for i in range(n))
+
+    if normalize:
+        # loudnorm each track before mixing (so one loud track doesn't drown
+        # out another), then loudnorm the summed output (mixing raises the
+        # combined level again since the waveforms add together).
+        pre = "".join(f"[0:a:{i}]loudnorm[n{i}];" for i in range(n))
+        inputs = "".join(f"[n{i}]" for i in range(n))
+        filter_complex = f"{pre}{inputs}amix=inputs={n}:duration=longest,loudnorm[aout]"
+    else:
+        inputs = "".join(f"[0:a:{i}]" for i in range(n))
+        filter_complex = f"{inputs}amix=inputs={n}:duration=longest[aout]"
 
     print(f"Merging {n} audio tracks -> {mixed_path}")
     subprocess.run(
@@ -87,7 +99,7 @@ def merge_audio_tracks(input_path: str) -> str:
             "-i",
             input_path,
             "-filter_complex",
-            f"{inputs}amix=inputs={n}:duration=longest[aout]",
+            filter_complex,
             "-map",
             "0:v",
             "-map",
@@ -112,8 +124,12 @@ def compress(
     margin: float,
     max_height: int = None,
     merge_audio: bool = False,
+    normalize_audio: bool = False,
+    open_dir: bool = False,
 ):
-    encode_input = merge_audio_tracks(input_path) if merge_audio else input_path
+    encode_input = (
+        merge_audio_tracks(input_path, normalize_audio) if merge_audio else input_path
+    )
 
     duration = get_duration_seconds(encode_input)
     video_kbps = calculate_video_bitrate_kbps(duration, target_mb, margin)
@@ -149,7 +165,11 @@ def compress(
     if encode_input != input_path:
         os.remove(encode_input)  # drop the temp merged-audio file
 
-    print(f"\nDone. Output written to {output_path}")
+    output_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"\nDone. Output written to {output_path} ({output_mb:.2f} MB)")
+
+    if open_dir:
+        os.startfile(os.path.dirname(os.path.abspath(output_path)))
 
 
 if __name__ == "__main__":
@@ -178,6 +198,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Mix all audio tracks into one before encoding (requires ffmpeg on PATH)",
     )
+    parser.add_argument(
+        "--normalize-audio",
+        action="store_true",
+        help="Loudness-normalize each track before mixing and the mixed result "
+        "after (only applies with --merge-audio)",
+    )
+    parser.add_argument(
+        "--open-dir",
+        action="store_true",
+        help="Open the output file's folder in Explorer when done",
+    )
     args = parser.parse_args()
 
     compress(
@@ -187,4 +218,6 @@ if __name__ == "__main__":
         args.margin,
         args.max_height,
         args.merge_audio,
+        args.normalize_audio,
+        args.open_dir,
     )
