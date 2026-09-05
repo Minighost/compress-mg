@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QSettings, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, QSettings, QThreadPool, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -35,8 +36,7 @@ from compressor import CompressionError, compress
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
-ORG_NAME = "compress-mg"
-APP_NAME = "CompressGUI"
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.ini"
 
 COL_NAME, COL_STATUS, COL_PROGRESS = range(3)
 
@@ -88,7 +88,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.resize(640, 480)
 
-        self.settings = QSettings(ORG_NAME, APP_NAME)
+        self.settings = QSettings(str(SETTINGS_FILE), QSettings.IniFormat)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(1)  # one HandBrake encode at a time
 
