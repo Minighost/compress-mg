@@ -84,7 +84,7 @@ class CompressWorker(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Compress-MG")
+        self.setWindowTitle("compress-mg")
         self.setAcceptDrops(True)
         self.resize(640, 480)
 
