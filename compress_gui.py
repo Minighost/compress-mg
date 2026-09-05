@@ -104,14 +104,19 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        master_layout = QVBoxLayout(central)
 
-        drop_label = QLabel("Drag and drop video files here")
-        drop_label.setAlignment(Qt.AlignCenter)
-        drop_label.setStyleSheet(
-            "border: 2px dashed gray; padding: 16px; color: gray;"
-        )
-        layout.addWidget(drop_label)
+        header_layout = QHBoxLayout()
+        add_video_button = QPushButton("+ Add Videos")
+        add_video_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        add_video_button.clicked.connect(self._browse_for_files)
+        header_layout.addWidget(add_video_button)
+        drop_label = QLabel("...Or drag and drop video files on the window")
+        drop_label.setStyleSheet("font-style: italic;")
+        header_layout.addWidget(drop_label)
+        header_layout.addStretch(1)
+
+        master_layout.addLayout(header_layout)
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["File", "Status", "Progress"])
@@ -125,7 +130,7 @@ class MainWindow(QMainWindow):
             COL_PROGRESS, QHeaderView.ResizeToContents
         )
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(self.table)
+        master_layout.addWidget(self.table)
 
         settings_box = QGroupBox("Settings")
         settings_layout = QHBoxLayout(settings_box)
@@ -157,17 +162,17 @@ class MainWindow(QMainWindow):
         self.normalize_audio_check.setEnabled(False)
         settings_layout.addWidget(self.normalize_audio_check)
 
-        layout.addWidget(settings_box)
+        master_layout.addWidget(settings_box)
 
         output_layout = QHBoxLayout()
+        browse_button = QPushButton("Change output folder")
+        browse_button.clicked.connect(self._choose_output_dir)
+        output_layout.addWidget(browse_button)
         output_layout.addWidget(QLabel("Output folder:"))
         self.output_dir_label = QLabel()
         self.output_dir_label.setStyleSheet("font-style: italic;")
         output_layout.addWidget(self.output_dir_label, stretch=1)
-        browse_button = QPushButton("Browse...")
-        browse_button.clicked.connect(self._choose_output_dir)
-        output_layout.addWidget(browse_button)
-        layout.addLayout(output_layout)
+        master_layout.addLayout(output_layout)
 
     def _on_merge_audio_toggled(self, checked: bool):
         self.normalize_audio_check.setEnabled(checked)
@@ -222,6 +227,20 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event: QDropEvent):
         paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        self._add_paths(paths)
+
+    # ---------- adding files ----------
+
+    def _browse_for_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose videos to compress",
+            "",
+            "Video files (*" + " *".join(sorted(VIDEO_EXTENSIONS)) + ")",
+        )
+        self._add_paths(paths)
+
+    def _add_paths(self, paths: list[str]):
         video_paths = [
             p for p in paths if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS
         ]
