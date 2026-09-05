@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSettings, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from compressor import CompressionError, compress
+from compressor import CancelToken, CompressionCancelled, CompressionError, compress
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
@@ -46,14 +46,22 @@ class WorkerSignals(QObject):
     status = Signal(str)
     finished = Signal(str)  # output path
     error = Signal(str)
+    cancelled = Signal()
 
 
 class CompressWorker(QRunnable):
-    def __init__(self, input_path: str, output_path: str, settings: dict):
+    def __init__(
+        self,
+        input_path: str,
+        output_path: str,
+        settings: dict,
+        cancel_token: CancelToken,
+    ):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
         self.settings = settings
+        self.cancel_token = cancel_token
         self.signals = WorkerSignals()
 
     def run(self):
@@ -68,7 +76,11 @@ class CompressWorker(QRunnable):
                 self.settings["normalize_audio"],
                 on_progress=self.signals.progress.emit,
                 on_status=self.signals.status.emit,
+                cancel_token=self.cancel_token,
             )
+        except CompressionCancelled:
+            self.signals.cancelled.emit()
+            return
         except CompressionError as e:
             self.signals.error.emit(str(e))
             return
@@ -96,6 +108,11 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.rows: dict[str, int] = {}
         self._columns_sized = False
+
+        self.running = False
+        self.stop_requested = False
+        self.current_cancel_token: CancelToken | None = None
+        self.current_path: str | None = None
 
         self._build_ui()
         self._load_settings()
@@ -127,6 +144,15 @@ class MainWindow(QMainWindow):
         drop_label.setStyleSheet("font-style: italic;")
         header_layout.addWidget(drop_label)
         header_layout.addStretch(1)
+
+        self.start_stop_button = QPushButton("Start")
+        self.start_stop_button.setEnabled(False)
+        self.start_stop_button.clicked.connect(self._toggle_start_stop)
+        header_layout.addWidget(self.start_stop_button)
+
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self._clear_queue)
+        header_layout.addWidget(clear_button)
 
         master_layout.addLayout(header_layout)
 
@@ -229,6 +255,8 @@ class MainWindow(QMainWindow):
         os.startfile(self.output_dir)
 
     def closeEvent(self, event):
+        if self.current_cancel_token is not None:
+            self.current_cancel_token.cancel()
         self._save_settings()
         super().closeEvent(event)
 
@@ -260,13 +288,16 @@ class MainWindow(QMainWindow):
         for path in video_paths:
             self._enqueue(path)
         self._process_next()
+        self._update_start_stop_button()
 
     # ---------- queue processing ----------
 
     def _enqueue(self, path: str):
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, COL_NAME, QTableWidgetItem(os.path.basename(path)))
+        name_item = QTableWidgetItem(os.path.basename(path))
+        name_item.setData(Qt.ItemDataRole.UserRole, path)
+        self.table.setItem(row, COL_NAME, name_item)
         self.table.setItem(row, COL_STATUS, QTableWidgetItem("Queued"))
         progress_bar = QProgressBar()
         progress_bar.setRange(0, 100)
@@ -275,10 +306,15 @@ class MainWindow(QMainWindow):
         self.queue.append(path)
 
     def _process_next(self):
-        if self.busy or not self.queue:
+        if self.busy or not self.running:
+            return
+        if not self.queue:
+            self.running = False
+            self._update_start_stop_button()
             return
         self.busy = True
         input_path = self.queue.pop(0)
+        self.current_path = input_path
 
         os.makedirs(self.output_dir, exist_ok=True)
         base, ext = os.path.splitext(os.path.basename(input_path))
@@ -292,31 +328,106 @@ class MainWindow(QMainWindow):
             "normalize_audio": self.normalize_audio_check.isChecked(),
         }
 
-        worker = CompressWorker(input_path, output_path, job_settings)
-        row = self.rows[input_path]
-        worker.signals.status.connect(lambda msg, r=row: self._set_status(r, msg))
-        worker.signals.progress.connect(lambda pct, r=row: self._set_progress(r, pct))
-        worker.signals.finished.connect(lambda out, r=row: self._on_finished(r, out))
-        worker.signals.error.connect(lambda msg, r=row: self._on_error(r, msg))
+        cancel_token = CancelToken()
+        self.current_cancel_token = cancel_token
+        worker = CompressWorker(input_path, output_path, job_settings, cancel_token)
+        worker.signals.status.connect(
+            lambda msg, p=input_path: self._set_status(p, msg)
+        )
+        worker.signals.progress.connect(
+            lambda pct, p=input_path: self._set_progress(p, pct)
+        )
+        worker.signals.finished.connect(
+            lambda out, p=input_path: self._on_finished(p, out)
+        )
+        worker.signals.error.connect(lambda msg, p=input_path: self._on_error(p, msg))
+        worker.signals.cancelled.connect(lambda p=input_path: self._on_cancelled(p))
         self.thread_pool.start(worker)
 
-    def _set_status(self, row: int, msg: str):
-        self.table.item(row, COL_STATUS).setText(msg)
+    def _set_status(self, path: str, msg: str):
+        self.table.item(self.rows[path], COL_STATUS).setText(msg)
 
-    def _set_progress(self, row: int, pct: float):
-        bar = self.table.cellWidget(row, COL_PROGRESS)
+    def _set_progress(self, path: str, pct: float):
+        bar = self.table.cellWidget(self.rows[path], COL_PROGRESS)
         bar.setValue(int(pct))
 
-    def _on_finished(self, row: int, output_path: str):
+    def _on_finished(self, path: str, output_path: str):
+        row = self.rows[path]
         self.table.item(row, COL_STATUS).setText("Done")
         self.table.cellWidget(row, COL_PROGRESS).setValue(100)
+        self._advance_or_halt()
+
+    def _on_error(self, path: str, message: str):
+        self.table.item(self.rows[path], COL_STATUS).setText(f"Error: {message}")
+        self._advance_or_halt()
+
+    def _on_cancelled(self, path: str):
+        self.table.item(self.rows[path], COL_STATUS).setText("Stopped")
+        self._advance_or_halt()
+
+    def _advance_or_halt(self):
         self.busy = False
+        self.current_cancel_token = None
+        self.current_path = None
+        if self.stop_requested:
+            self.stop_requested = False
+            self.running = False
+            self._update_start_stop_button()
+            return
+        if self.running:
+            self._process_next()
+        else:
+            self._update_start_stop_button()
+
+    # ---------- start / stop / clear ----------
+
+    def _toggle_start_stop(self):
+        if self.running:
+            self._stop_queue()
+        else:
+            self._start_queue()
+
+    def _start_queue(self):
+        if not self.queue or self.running:
+            return
+        self.running = True
+        self._update_start_stop_button()
         self._process_next()
 
-    def _on_error(self, row: int, message: str):
-        self.table.item(row, COL_STATUS).setText(f"Error: {message}")
-        self.busy = False
-        self._process_next()
+    def _stop_queue(self):
+        if not self.running or self.stop_requested:
+            return
+        self.stop_requested = True
+        self._update_start_stop_button()
+        if self.current_cancel_token is not None:
+            self.current_cancel_token.cancel()
+
+    def _update_start_stop_button(self):
+        if self.stop_requested:
+            self.start_stop_button.setText("Stopping...")
+            self.start_stop_button.setEnabled(False)
+        elif self.running:
+            self.start_stop_button.setText("Stop")
+            self.start_stop_button.setEnabled(True)
+        else:
+            self.start_stop_button.setText("Start")
+            self.start_stop_button.setEnabled(bool(self.queue))
+
+    def _clear_queue(self):
+        for row in reversed(range(self.table.rowCount())):
+            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
+            if path == self.current_path and path is not None:
+                continue
+            self.table.removeRow(row)
+        self.queue.clear()
+        self._rebuild_row_index()
+        self._update_start_stop_button()
+
+    def _rebuild_row_index(self):
+        self.rows = {
+            self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole): row
+            for row in range(self.table.rowCount())
+        }
 
 
 def main():
