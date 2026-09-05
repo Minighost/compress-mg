@@ -6,6 +6,15 @@ It is highly recommended to use [LosslessCut](https://github.com/mifi/lossless-c
 
 Main goal was to answer the "What's the best bitrate I can use while also making it sendable on Discord?" question.
 
+## Requirements
+
+You'll need `handbrakecli` and `ffmpeg` on your PATH.
+
+You can use `winget` to install both:
+`winget install HandBrake.HandBrake.CLI`
+`winget install Gyan.FFmpeg`
+It should add them to your PATH automatically.
+
 ## Installation
 
 Either download a release or compile the program yourself.
