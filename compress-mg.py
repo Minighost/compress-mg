@@ -171,9 +171,12 @@ class MainWindow(QMainWindow):
         master_layout.addWidget(settings_box)
 
         output_layout = QHBoxLayout()
-        browse_button = QPushButton("Change output folder")
+        browse_button = QPushButton("Change")
         browse_button.clicked.connect(self._choose_output_dir)
         output_layout.addWidget(browse_button)
+        open_button = QPushButton("Open")
+        open_button.clicked.connect(self._open_output_dir)
+        output_layout.addWidget(open_button)
         output_layout.addWidget(QLabel("Output folder:"))
         self.output_dir_label = QLabel()
         self.output_dir_label.setStyleSheet("font-style: italic;")
@@ -220,6 +223,10 @@ class MainWindow(QMainWindow):
             self.output_dir = chosen
             self.output_dir_label.setText(chosen)
             self._save_settings()
+
+    def _open_output_dir(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.startfile(self.output_dir)
 
     def closeEvent(self, event):
         self._save_settings()
