@@ -95,9 +95,21 @@ class MainWindow(QMainWindow):
         self.queue: list[str] = []
         self.busy = False
         self.rows: dict[str, int] = {}
+        self._columns_sized = False
 
         self._build_ui()
         self._load_settings()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._columns_sized:
+            self._size_columns()
+            self._columns_sized = True
+
+    def _size_columns(self):
+        total = self.table.viewport().width()
+        self.table.setColumnWidth(COL_NAME, int(total * 0.8))
+        self.table.setColumnWidth(COL_STATUS, int(total * 0.1))
 
     # ---------- UI construction ----------
 
@@ -120,15 +132,9 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["File", "Status", "Progress"])
-        self.table.horizontalHeader().setSectionResizeMode(
-            COL_NAME, QHeaderView.Stretch
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            COL_STATUS, QHeaderView.ResizeToContents
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            COL_PROGRESS, QHeaderView.ResizeToContents
-        )
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
         master_layout.addWidget(self.table)
 
