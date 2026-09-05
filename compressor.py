@@ -239,6 +239,7 @@ def compress(
     target_mb: float,
     margin: float,
     max_height: int = None,
+    framerate: Optional[str] = None,
     merge_audio: bool = False,
     normalize_audio: bool = False,
     on_progress=None,
@@ -274,6 +275,7 @@ def compress(
             f"Duration: {duration:.1f}s | Target: {target_mb}MB | Margin: {margin} | "
             f"Video bitrate: {video_kbps} kbps | Audio: {AUDIO_BITRATE_KBPS} kbps"
             + (f" | Max height: {max_height}p" if max_height else "")
+            + (f" | Framerate: {framerate}" if framerate else "")
         )
 
         cmd = [
@@ -295,6 +297,8 @@ def compress(
         ]
         if max_height:
             cmd += ["--maxHeight", str(max_height)]
+        if framerate:
+            cmd += ["--rate", str(framerate), "--cfr"]
 
         status("Encoding...")
         try:

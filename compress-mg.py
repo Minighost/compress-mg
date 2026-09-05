@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
@@ -78,6 +79,7 @@ class CompressWorker(QRunnable):
                 self.settings["target_mb"],
                 self.settings["margin"],
                 self.settings["max_height"],
+                self.settings["framerate"],
                 self.settings["merge_audio"],
                 self.settings["normalize_audio"],
                 on_progress=self.signals.progress.emit,
@@ -181,34 +183,53 @@ class MainWindow(QMainWindow):
         master_layout.addWidget(self.table)
 
         settings_box = QGroupBox("Settings")
-        settings_layout = QHBoxLayout(settings_box)
+        settings_layout = QVBoxLayout(settings_box)
 
-        settings_layout.addWidget(QLabel("Target size (MB):"))
+        # settings row 0
+        settings_row_layout0 = QHBoxLayout()
+        settings_row_layout0.addWidget(QLabel("Target size (MB):"))
         self.size_spin = QDoubleSpinBox()
         self.size_spin.setRange(0.5, 1000.0)
         self.size_spin.setValue(7.0)
-        settings_layout.addWidget(self.size_spin)
+        settings_row_layout0.addWidget(self.size_spin)
 
-        settings_layout.addWidget(QLabel("Margin:"))
+        settings_row_layout0.addWidget(QLabel("Margin:"))
         self.margin_spin = QDoubleSpinBox()
         self.margin_spin.setRange(0.5, 1.0)
         self.margin_spin.setSingleStep(0.01)
         self.margin_spin.setValue(0.99)
-        settings_layout.addWidget(self.margin_spin)
+        settings_row_layout0.addWidget(self.margin_spin)
 
-        settings_layout.addWidget(QLabel("Max height (0 = no cap):"))
+        settings_row_layout0.addWidget(QLabel("Max height (0 = no cap):"))
         self.max_height_spin = QSpinBox()
         self.max_height_spin.setRange(0, 8192)
-        self.max_height_spin.setValue(0)
-        settings_layout.addWidget(self.max_height_spin)
+        self.max_height_spin.setValue(720)
+        settings_row_layout0.addWidget(self.max_height_spin)
+
+        # settings row 1
+        settings_row_layout1 = QHBoxLayout()
+        settings_row_layout1.addWidget(QLabel("Framerate:"))
+        self.framerate_combo = QComboBox()
+        self.framerate_combo.setEditable(True)
+        self.framerate_combo.addItems(
+            ["Same as source", "60", "50", "30", "25", "24", "23.976"]
+        )
+        self.framerate_combo.setCurrentText("Same as source")
+        settings_row_layout1.addWidget(self.framerate_combo)
 
         self.merge_audio_check = QCheckBox("Merge audio tracks")
         self.merge_audio_check.toggled.connect(self._on_merge_audio_toggled)
-        settings_layout.addWidget(self.merge_audio_check)
+        settings_row_layout1.addWidget(self.merge_audio_check)
 
         self.normalize_audio_check = QCheckBox("Normalize audio")
         self.normalize_audio_check.setEnabled(False)
-        settings_layout.addWidget(self.normalize_audio_check)
+        settings_row_layout1.addWidget(self.normalize_audio_check)
+
+        # compile settings rows
+        settings_layout.addLayout(settings_row_layout0)
+        settings_layout.setAlignment(settings_row_layout0, Qt.AlignLeft)
+        settings_layout.addLayout(settings_row_layout1)
+        settings_layout.setAlignment(settings_row_layout1, Qt.AlignLeft)
 
         master_layout.addWidget(settings_box)
 
@@ -239,7 +260,10 @@ class MainWindow(QMainWindow):
 
         self.size_spin.setValue(float(self.settings.value("target_mb", 7.0)))
         self.margin_spin.setValue(float(self.settings.value("margin", 0.99)))
-        self.max_height_spin.setValue(int(self.settings.value("max_height", 0)))
+        self.max_height_spin.setValue(int(self.settings.value("max_height", 720)))
+        self.framerate_combo.setCurrentText(
+            str(self.settings.value("framerate", "Same as source"))
+        )
         self.merge_audio_check.setChecked(
             self.settings.value("merge_audio", False, type=bool)
         )
@@ -253,6 +277,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("target_mb", self.size_spin.value())
         self.settings.setValue("margin", self.margin_spin.value())
         self.settings.setValue("max_height", self.max_height_spin.value())
+        self.settings.setValue("framerate", self.framerate_combo.currentText())
         self.settings.setValue("merge_audio", self.merge_audio_check.isChecked())
         self.settings.setValue(
             "normalize_audio", self.normalize_audio_check.isChecked()
@@ -345,10 +370,14 @@ class MainWindow(QMainWindow):
         base, ext = os.path.splitext(os.path.basename(input_path))
         output_path = os.path.join(self.output_dir, f"{base}_compressed{ext}")
 
+        framerate_text = self.framerate_combo.currentText().strip()
         job_settings = {
             "target_mb": self.size_spin.value(),
             "margin": self.margin_spin.value(),
             "max_height": self.max_height_spin.value() or None,
+            "framerate": (
+                None if framerate_text == "Same as source" else framerate_text
+            ),
             "merge_audio": self.merge_audio_check.isChecked(),
             "normalize_audio": self.normalize_audio_check.isChecked(),
         }
