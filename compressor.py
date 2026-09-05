@@ -1,8 +1,3 @@
-"""
-Core video-compression logic (HandBrakeCLI + ffmpeg), extracted from
-compress_to_size.py so it can be imported by both the CLI and the GUI.
-"""
-
 import os
 import re
 import signal
@@ -15,8 +10,10 @@ HANDBRAKE_CLI = "HandBrakeCLI"  # change to full path if it's not on your PATH,
 # e.g. r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
 FFMPEG = "ffmpeg"  # change to full path if it's not on your PATH
 
-AUDIO_BITRATE_KBPS = 128  # what we'll encode audio at
+AUDIO_BITRATE_KBPS = 128
 
+# This is the amount of time (in seconds) before sending a SIGKILL to a running
+# subprocess after a "Ctrl+C" is sent.
 CANCEL_GRACE_PERIOD_S = 2.0
 
 

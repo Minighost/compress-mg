@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-Drag-and-drop Qt6 GUI for compress_to_size's compression logic.
-
-Usage:
-    python compress_gui.py
-"""
-
 import os
 import sys
 from pathlib import Path
@@ -40,7 +32,9 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.ini"
 
-COL_NAME, COL_STATUS, COL_PROGRESS = range(3)
+COL_NAME = 0
+COL_STATUS = 1
+COL_PROGRESS = 2
 
 
 class WorkerSignals(QObject):
