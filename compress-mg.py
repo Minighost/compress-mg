@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QDoubleSpinBox,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -162,6 +164,10 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_context_menu)
         master_layout.addWidget(self.table)
 
         settings_box = QGroupBox("Settings")
@@ -428,6 +434,46 @@ class MainWindow(QMainWindow):
             self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole): row
             for row in range(self.table.rowCount())
         }
+
+    # ---------- table context menu ----------
+
+    def _show_table_context_menu(self, pos):
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not selected_rows:
+            return
+        menu = QMenu(self)
+        requeue_action = menu.addAction("Set to Queued")
+        remove_action = menu.addAction("Remove")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == requeue_action:
+            self._requeue_rows(selected_rows)
+        elif chosen == remove_action:
+            self._remove_rows(selected_rows)
+
+    def _requeue_rows(self, rows: list[int]):
+        for row in rows:
+            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
+            if path is None or path == self.current_path:
+                continue
+            self.table.item(row, COL_STATUS).setText("Queued")
+            bar = self.table.cellWidget(row, COL_PROGRESS)
+            if bar is not None:
+                bar.setValue(0)
+            if path not in self.queue:
+                self.queue.append(path)
+        self._update_start_stop_button()
+        self._process_next()
+
+    def _remove_rows(self, rows: list[int]):
+        for row in sorted(rows, reverse=True):
+            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
+            if path == self.current_path and path is not None:
+                continue
+            if path in self.queue:
+                self.queue.remove(path)
+            self.table.removeRow(row)
+        self._rebuild_row_index()
+        self._update_start_stop_button()
 
 
 def main():
