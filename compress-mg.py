@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,14 @@ from PySide6.QtWidgets import (
 )
 
 from compressor import CancelToken, CompressionCancelled, CompressionError, compress
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("compress-mg")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
@@ -61,6 +70,7 @@ class CompressWorker(QRunnable):
         self.signals = WorkerSignals()
 
     def run(self):
+        log.info("Starting compression: %s", self.input_path)
         try:
             compress(
                 self.input_path,
@@ -75,17 +85,22 @@ class CompressWorker(QRunnable):
                 cancel_token=self.cancel_token,
             )
         except CompressionCancelled:
+            log.info("Cancelled: %s", self.input_path)
             self.signals.cancelled.emit()
             return
         except CompressionError as e:
+            log.error("Compression error on %s: %s", self.input_path, e)
             self.signals.error.emit(str(e))
             return
         except FileNotFoundError as e:
+            log.error("Required tool not found on PATH: %s", e.filename)
             self.signals.error.emit(f"Required tool not found on PATH: {e.filename}")
             return
         except Exception as e:  # subprocess failures, unexpected errors
+            log.error("Unexpected error on %s: %s", self.input_path, e)
             self.signals.error.emit(str(e))
             return
+        log.info("Finished compression: %s -> %s", self.input_path, self.output_path)
         self.signals.finished.emit(self.output_path)
 
 
@@ -112,6 +127,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_settings()
+        log.info("Main window initialized")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -230,6 +246,7 @@ class MainWindow(QMainWindow):
         self.normalize_audio_check.setChecked(
             self.settings.value("normalize_audio", False, type=bool)
         )
+        log.info("Loaded settings from %s", SETTINGS_FILE)
 
     def _save_settings(self):
         self.settings.setValue("output_dir", self.output_dir)
@@ -255,6 +272,7 @@ class MainWindow(QMainWindow):
         os.startfile(self.output_dir)
 
     def closeEvent(self, event):
+        log.info("Closing main window, shutting down")
         if self.current_cancel_token is not None:
             self.current_cancel_token.cancel()
         self._save_settings()
@@ -285,8 +303,12 @@ class MainWindow(QMainWindow):
         video_paths = [
             p for p in paths if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS
         ]
+        skipped = len(paths) - len(video_paths)
+        if skipped:
+            log.info("Ignored %d non-video file(s)", skipped)
         for path in video_paths:
             self._enqueue(path)
+        log.info("Added %d file(s) to queue", len(video_paths))
         self._process_next()
         self._update_start_stop_button()
 
@@ -315,6 +337,9 @@ class MainWindow(QMainWindow):
         self.busy = True
         input_path = self.queue.pop(0)
         self.current_path = input_path
+        log.info(
+            "Dequeued next job: %s (%d remaining in queue)", input_path, len(self.queue)
+        )
 
         os.makedirs(self.output_dir, exist_ok=True)
         base, ext = os.path.splitext(os.path.basename(input_path))
@@ -345,6 +370,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _set_status(self, path: str, msg: str):
+        log.info("%s: %s", os.path.basename(path), msg)
         self.table.item(self.rows[path], COL_STATUS).setText(msg)
 
     def _set_progress(self, path: str, pct: float):
@@ -352,16 +378,19 @@ class MainWindow(QMainWindow):
         bar.setValue(int(pct))
 
     def _on_finished(self, path: str, output_path: str):
+        log.info("Done: %s -> %s", os.path.basename(path), output_path)
         row = self.rows[path]
         self.table.item(row, COL_STATUS).setText("Done")
         self.table.cellWidget(row, COL_PROGRESS).setValue(100)
         self._advance_or_halt()
 
     def _on_error(self, path: str, message: str):
+        log.error("Failed: %s (%s)", os.path.basename(path), message)
         self.table.item(self.rows[path], COL_STATUS).setText(f"Error: {message}")
         self._advance_or_halt()
 
     def _on_cancelled(self, path: str):
+        log.info("Stopped: %s", os.path.basename(path))
         self.table.item(self.rows[path], COL_STATUS).setText("Stopped")
         self._advance_or_halt()
 
@@ -390,6 +419,7 @@ class MainWindow(QMainWindow):
     def _start_queue(self):
         if not self.queue or self.running:
             return
+        log.info("Queue started (%d file(s) pending)", len(self.queue))
         self.running = True
         self._update_start_stop_button()
         self._process_next()
@@ -397,6 +427,7 @@ class MainWindow(QMainWindow):
     def _stop_queue(self):
         if not self.running or self.stop_requested:
             return
+        log.info("Stop requested, cancelling current job and halting queue")
         self.stop_requested = True
         self._update_start_stop_button()
         if self.current_cancel_token is not None:
@@ -414,6 +445,7 @@ class MainWindow(QMainWindow):
             self.start_stop_button.setEnabled(bool(self.queue))
 
     def _clear_queue(self):
+        log.info("Clearing queue")
         for row in reversed(range(self.table.rowCount())):
             path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
             if path == self.current_path and path is not None:
@@ -445,6 +477,7 @@ class MainWindow(QMainWindow):
             self._remove_rows(selected_rows)
 
     def _requeue_rows(self, rows: list[int]):
+        log.info("Re-queuing %d row(s)", len(rows))
         for row in rows:
             path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
             if path is None or path == self.current_path:
@@ -459,6 +492,7 @@ class MainWindow(QMainWindow):
         self._process_next()
 
     def _remove_rows(self, rows: list[int]):
+        log.info("Removing %d row(s)", len(rows))
         for row in sorted(rows, reverse=True):
             path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
             if path == self.current_path and path is not None:
@@ -471,9 +505,13 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    log.info("Starting compress-mg...")
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    log.info("=" * 60)
+    log.info("compress-mg depends on this console window, do not close me!")
+    log.info("=" * 60)
     sys.exit(app.exec())
 
 
