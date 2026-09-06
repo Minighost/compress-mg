@@ -298,7 +298,7 @@ def compress(
         if max_height:
             cmd += ["--maxHeight", str(max_height)]
         if framerate:
-            cmd += ["--rate", str(framerate), "--cfr"]
+            cmd += ["--rate", str(framerate), "--pfr"]
 
         status("Encoding...")
         try:
