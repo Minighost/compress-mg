@@ -26,4 +26,5 @@ Just run the program. Keep the console window open, the GUI depends on it.
 
 Should be pretty self-explanatory, but you can add videos to the queue by browsing for them or drag-dropping them onto the GUI.
 
-Click "Start" to begin working on the queue. "Clear" will clear *all* items from the queue.
+Click "Start" to begin working on the queue. "Clear" will clear *all* queued items; the file currently being encoded keeps going and stays in the list. Use "Stop" first if you want to cancel it.
+

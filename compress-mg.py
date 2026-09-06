@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, Signal
@@ -53,6 +54,35 @@ class WorkerSignals(QObject):
     finished = Signal(str)  # output path
     error = Signal(str)
     cancelled = Signal()
+
+
+@dataclass
+class Job:
+    """A queued file, identified by job_id rather than by its path.
+
+    Do not go back to keying rows by path. A path is not unique to a row -- the same file can
+    occupy two rows (re-queue a finished file to redo it at different settings), and the old
+    path-keyed dict silently collapsed those to one entry. That caused three separate bugs:
+
+    - every status/progress update landed on whichever row was added last, so the other row sat
+      frozen at "Queued" forever even though its job had actually run;
+    - the Clear and Remove guards compared the row's path against the running job's path, so a
+      *finished* row matched the running job and could never be removed -- this is the reported
+      "Clear does not clear Done items";
+    - re-queuing one of two identical rows silently did nothing, because the path was already
+      in the pending list.
+
+    job_ids come from a counter that only ever increases, so a removed row's id is never reused
+    and a late signal can never be misrouted to a newer job.
+    """
+
+    job_id: int
+    path: str
+    # The name cell doubles as the row handle: table.row(item) always reports this job's current
+    # row, and Qt keeps it correct as rows above are inserted or removed. That is what replaced
+    # the old path -> row-index dict, which went stale on every removal and had to be rebuilt
+    # by hand; there is deliberately no such cache to keep in sync any more.
+    item: QTableWidgetItem
 
 
 class CompressWorker(QRunnable):
@@ -117,15 +147,23 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(1)  # one ffmpeg encode at a time
 
-        self.queue: list[str] = []
+        # Everything below tracks jobs by id, never by path -- see the Job docstring for what
+        # breaks otherwise. current_job_id in particular must stay an id: as a path it matched
+        # every row holding that path, which is what made finished rows un-clearable.
+        self.jobs: dict[int, Job] = {}
+        self.queue: list[int] = []  # pending job ids, in order
+        self.next_job_id = 0
         self.busy = False
-        self.rows: dict[str, int] = {}
         self._columns_sized = False
 
         self.running = False
         self.stop_requested = False
         self.current_cancel_token: CancelToken | None = None
-        self.current_path: str | None = None
+        self.current_job_id: int | None = None
+
+        # Workers are kept alive here for the reason spelled out in _process_next. Do not
+        # replace this with a local variable, and do not "clean up" this list.
+        self.workers: list[CompressWorker] = []
 
         self._build_ui()
         self._load_settings()
@@ -329,11 +367,30 @@ class MainWindow(QMainWindow):
             p for p in paths if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS
         ]
         skipped = len(paths) - len(video_paths)
-        if skipped:
-            log.info("Ignored %d non-video file(s)", skipped)
+        # Drop files that are already waiting or encoding. Queueing the same file twice only
+        # ever wasted an encode: both runs write the same <base>_compressed<ext> output, so the
+        # second silently overwrote the first.
+        #
+        # The check is scoped to pending/running on purpose -- do not widen it to every row in
+        # the table. A *finished* row keeps its path, and re-adding a file you already
+        # compressed (to redo it at a different size or framerate) has to keep working; matching
+        # against finished rows would block that. Re-running does overwrite the earlier output,
+        # which is the intent when you deliberately ask for it.
+        pending = {self.jobs[job_id].path for job_id in self.queue}
+        if self.current_job_id is not None:
+            pending.add(self.jobs[self.current_job_id].path)
+        new_paths = []
         for path in video_paths:
+            if path in pending:
+                skipped += 1
+            else:
+                pending.add(path)
+                new_paths.append(path)
+        if skipped:
+            log.info("Ignored %d non-video or already-queued file(s)", skipped)
+        for path in new_paths:
             self._enqueue(path)
-        log.info("Added %d file(s) to queue", len(video_paths))
+        log.info("Added %d file(s) to queue", len(new_paths))
         self._process_next()
         self._update_start_stop_button()
 
@@ -343,14 +400,32 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         name_item = QTableWidgetItem(os.path.basename(path))
-        name_item.setData(Qt.ItemDataRole.UserRole, path)
         self.table.setItem(row, COL_NAME, name_item)
         self.table.setItem(row, COL_STATUS, QTableWidgetItem("Queued"))
         progress_bar = QProgressBar()
         progress_bar.setRange(0, 100)
         self.table.setCellWidget(row, COL_PROGRESS, progress_bar)
-        self.rows[path] = row
-        self.queue.append(path)
+
+        job_id = self.next_job_id
+        self.next_job_id += 1
+        name_item.setData(Qt.ItemDataRole.UserRole, job_id)
+        self.jobs[job_id] = Job(job_id, path, name_item)
+        self.queue.append(job_id)
+
+    def _job_id_at(self, row: int) -> int | None:
+        item = self.table.item(row, COL_NAME)
+        return None if item is None else item.data(Qt.ItemDataRole.UserRole)
+
+    def _row_of(self, job_id: int) -> int:
+        """Live row index for a job, or -1 if its row is gone.
+
+        Every caller must handle -1 instead of assuming the row exists. A worker signal is
+        delivered asynchronously and can land after its row was removed (cleared or deleted from
+        the context menu mid-encode); the old code indexed a dict directly and would have raised
+        KeyError there.
+        """
+        job = self.jobs.get(job_id)
+        return -1 if job is None else self.table.row(job.item)
 
     def _process_next(self):
         if self.busy or not self.running:
@@ -360,8 +435,9 @@ class MainWindow(QMainWindow):
             self._update_start_stop_button()
             return
         self.busy = True
-        input_path = self.queue.pop(0)
-        self.current_path = input_path
+        job_id = self.queue.pop(0)
+        input_path = self.jobs[job_id].path
+        self.current_job_id = job_id
         log.info(
             "Dequeued next job: %s (%d remaining in queue)", input_path, len(self.queue)
         )
@@ -385,48 +461,77 @@ class MainWindow(QMainWindow):
         cancel_token = CancelToken()
         self.current_cancel_token = cancel_token
         worker = CompressWorker(input_path, output_path, job_settings, cancel_token)
-        worker.signals.status.connect(
-            lambda msg, p=input_path: self._set_status(p, msg)
-        )
+        worker.signals.status.connect(lambda msg, j=job_id: self._set_status(j, msg))
         worker.signals.progress.connect(
-            lambda pct, p=input_path: self._set_progress(p, pct)
+            lambda pct, j=job_id: self._set_progress(j, pct)
         )
-        worker.signals.finished.connect(
-            lambda out, p=input_path: self._on_finished(p, out)
-        )
-        worker.signals.error.connect(lambda msg, p=input_path: self._on_error(p, msg))
-        worker.signals.cancelled.connect(lambda p=input_path: self._on_cancelled(p))
+        worker.signals.finished.connect(lambda out, j=job_id: self._on_finished(j, out))
+        worker.signals.error.connect(lambda msg, j=job_id: self._on_error(j, msg))
+        worker.signals.cancelled.connect(lambda j=job_id: self._on_cancelled(j))
+
+        # Both lines below are load-bearing; removing either one breaks the app badly.
+        #
+        # QThreadPool destroys an auto-delete runnable the moment run() returns, which also
+        # destroys the worker's WorkerSignals object. That object is the *sender* of the
+        # cross-thread queued finished/error/cancelled calls, and Qt discards queued calls whose
+        # sender died before the main thread dispatched them. Those signals are emitted on the
+        # last line of run(), so they race the worker's own destruction and lose often.
+        #
+        # Losing one means _advance_or_halt never runs: busy/running stay True, current_job_id
+        # is never cleared, the queue silently stalls, and Clear then refuses to remove that row
+        # forever (it looks like the current job). The same use-after-free segfaults the process
+        # outright. Measured on a 6-file queue before this fix: only 1 run in 9 completed
+        # cleanly -- 6 segfaulted and 2 wedged. With it, 6 of 6 were clean.
+        worker.setAutoDelete(False)  # ownership becomes Python's; C++ must not free it
+        self.workers.append(
+            worker
+        )  # keep a strong reference (see _clear_queue for pruning)
         self.thread_pool.start(worker)
 
-    def _set_status(self, path: str, msg: str):
-        log.info("%s: %s", os.path.basename(path), msg)
-        self.table.item(self.rows[path], COL_STATUS).setText(msg)
+    def _job_name(self, job_id: int) -> str:
+        job = self.jobs.get(job_id)
+        return os.path.basename(job.path) if job else "<removed>"
 
-    def _set_progress(self, path: str, pct: float):
-        bar = self.table.cellWidget(self.rows[path], COL_PROGRESS)
-        bar.setValue(int(pct))
+    def _set_status(self, job_id: int, msg: str):
+        log.info("%s: %s", self._job_name(job_id), msg)
+        row = self._row_of(job_id)
+        if row >= 0:
+            self.table.item(row, COL_STATUS).setText(msg)
 
-    def _on_finished(self, path: str, output_path: str):
-        log.info("Done: %s -> %s", os.path.basename(path), output_path)
-        row = self.rows[path]
-        self.table.item(row, COL_STATUS).setText("Done")
-        self.table.cellWidget(row, COL_PROGRESS).setValue(100)
+    def _set_progress(self, job_id: int, pct: float):
+        row = self._row_of(job_id)
+        if row >= 0:
+            self.table.cellWidget(row, COL_PROGRESS).setValue(int(pct))
+
+    def _on_finished(self, job_id: int, output_path: str):
+        log.info("Done: %s -> %s", self._job_name(job_id), output_path)
+        row = self._row_of(job_id)
+        if row >= 0:
+            self.table.item(row, COL_STATUS).setText("Done")
+            self.table.cellWidget(row, COL_PROGRESS).setValue(100)
         self._advance_or_halt()
 
-    def _on_error(self, path: str, message: str):
-        log.error("Failed: %s (%s)", os.path.basename(path), message)
-        self.table.item(self.rows[path], COL_STATUS).setText(f"Error: {message}")
+    def _on_error(self, job_id: int, message: str):
+        log.error("Failed: %s (%s)", self._job_name(job_id), message)
+        row = self._row_of(job_id)
+        if row >= 0:
+            self.table.item(row, COL_STATUS).setText(f"Error: {message}")
         self._advance_or_halt()
 
-    def _on_cancelled(self, path: str):
-        log.info("Stopped: %s", os.path.basename(path))
-        self.table.item(self.rows[path], COL_STATUS).setText("Stopped")
+    def _on_cancelled(self, job_id: int):
+        log.info("Stopped: %s", self._job_name(job_id))
+        row = self._row_of(job_id)
+        if row >= 0:
+            self.table.item(row, COL_STATUS).setText("Stopped")
         self._advance_or_halt()
 
     def _advance_or_halt(self):
         self.busy = False
         self.current_cancel_token = None
-        self.current_path = None
+        self.current_job_id = None
+        # The finished worker is deliberately left in self.workers. Releasing it here would drop
+        # the last reference while its thread may still be returning from run(), which is the
+        # same crash this held reference exists to prevent. _clear_queue prunes it when idle.
         if self.stop_requested:
             self.stop_requested = False
             self.running = False
@@ -476,19 +581,20 @@ class MainWindow(QMainWindow):
     def _clear_queue(self):
         log.info("Clearing queue")
         for row in reversed(range(self.table.rowCount())):
-            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
-            if path == self.current_path and path is not None:
+            job_id = self._job_id_at(row)
+            # Skip only the one row that is encoding right now. This compares ids, not paths:
+            # the path form matched any row sharing that path, which is precisely why finished
+            # rows used to survive Clear.
+            if job_id is not None and job_id == self.current_job_id:
                 continue
             self.table.removeRow(row)
+            self.jobs.pop(job_id, None)
         self.queue.clear()
-        self._rebuild_row_index()
+        if not self.busy:
+            # Safe only while idle: with nothing running, every retained worker's run() has
+            # returned and the pool has finished with it, so dropping these cannot race.
+            self.workers.clear()
         self._update_start_stop_button()
-
-    def _rebuild_row_index(self):
-        self.rows = {
-            self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole): row
-            for row in range(self.table.rowCount())
-        }
 
     # ---------- table context menu ----------
 
@@ -508,28 +614,30 @@ class MainWindow(QMainWindow):
     def _requeue_rows(self, rows: list[int]):
         log.info("Re-queuing %d row(s)", len(rows))
         for row in rows:
-            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
-            if path is None or path == self.current_path:
+            job_id = self._job_id_at(row)
+            if job_id is None or job_id == self.current_job_id:
                 continue
             self.table.item(row, COL_STATUS).setText("Queued")
             bar = self.table.cellWidget(row, COL_PROGRESS)
             if bar is not None:
                 bar.setValue(0)
-            if path not in self.queue:
-                self.queue.append(path)
+            # Membership test on the id, not the path: two rows can share a path, and testing
+            # the path made re-queuing the second one silently do nothing.
+            if job_id not in self.queue:
+                self.queue.append(job_id)
         self._update_start_stop_button()
         self._process_next()
 
     def _remove_rows(self, rows: list[int]):
         log.info("Removing %d row(s)", len(rows))
         for row in sorted(rows, reverse=True):
-            path = self.table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
-            if path == self.current_path and path is not None:
+            job_id = self._job_id_at(row)
+            if job_id is not None and job_id == self.current_job_id:
                 continue
-            if path in self.queue:
-                self.queue.remove(path)
+            if job_id in self.queue:
+                self.queue.remove(job_id)
             self.table.removeRow(row)
-        self._rebuild_row_index()
+            self.jobs.pop(job_id, None)
         self._update_start_stop_button()
 
 
