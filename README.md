@@ -1,6 +1,6 @@
 # compress-mg
 
-`handbrakecli` and `ffmpeg` wrapper to compress videos to a desired size.
+`ffmpeg` wrapper to compress videos to a desired size.
 
 It is highly recommended to use [LosslessCut](https://github.com/mifi/lossless-cut) to trim your videos before feeding them into this program.
 
@@ -8,12 +8,11 @@ Main goal was to answer the "What's the best bitrate I can use while also making
 
 ## Requirements
 
-You'll need `handbrakecli` and `ffmpeg` on your PATH.
+You'll need `ffmpeg` (which includes `ffprobe`) on your PATH.
 
-You can use `winget` to install both:
-`winget install HandBrake.HandBrake.CLI`
+You can use `winget` to install it:
 `winget install Gyan.FFmpeg`
-It should add them to your PATH automatically.
+It should add it to your PATH automatically.
 
 ## Installation
 

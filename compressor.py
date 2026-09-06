@@ -1,14 +1,13 @@
 import os
-import re
 import signal
 import subprocess
 import threading
 import time
-from typing import Optional
+from collections import deque
+from typing import Callable, Optional
 
-HANDBRAKE_CLI = "HandBrakeCLI"  # change to full path if it's not on your PATH,
-# e.g. r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
 FFMPEG = "ffmpeg"  # change to full path if it's not on your PATH
+FFPROBE = "ffprobe"  # change to full path if it's not on your PATH
 
 AUDIO_BITRATE_KBPS = 128
 
@@ -88,18 +87,32 @@ def _safe_remove(path: str, attempts: int = 3, delay: float = 0.2):
 
 
 def get_duration_seconds(input_path: str) -> float:
-    """Scan the file with HandBrake and pull the duration out of its output."""
+    """Look up the file's duration via ffprobe."""
     result = subprocess.run(
-        [HANDBRAKE_CLI, "-i", input_path, "--scan"], capture_output=True, text=True
+        [
+            FFPROBE,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            input_path,
+        ],
+        capture_output=True,
+        text=True,
     )
-    combined = result.stdout + result.stderr
-    match = re.search(r"duration:\s*(\d+):(\d+):(\d+)", combined, re.IGNORECASE)
-    if not match:
+    output = result.stdout.strip()
+    try:
+        duration = float(output)
+    except ValueError:
         raise CompressionError(
-            "Couldn't determine video duration from HandBrake's scan output."
+            f"Couldn't determine video duration from ffprobe output "
+            f"({output!r}). ffprobe stderr: {result.stderr.strip()}"
         )
-    hours, minutes, seconds = map(int, match.groups())
-    return hours * 3600 + minutes * 60 + seconds
+    if duration <= 0:
+        raise CompressionError("ffprobe reported a non-positive duration.")
+    return duration
 
 
 def calculate_video_bitrate_kbps(
@@ -119,7 +132,7 @@ def calculate_video_bitrate_kbps(
 def count_audio_streams(input_path: str) -> int:
     result = subprocess.run(
         [
-            "ffprobe",
+            FFPROBE,
             "-v",
             "error",
             "-select_streams",
@@ -136,43 +149,90 @@ def count_audio_streams(input_path: str) -> int:
     return len([line for line in result.stdout.strip().splitlines() if line])
 
 
-_PROGRESS_RE = re.compile(r"Encoding:.*?(\d+(?:\.\d+)?)\s*%")
+def _parse_ffmpeg_timestamp(ts: str) -> float:
+    hours, minutes, seconds = ts.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
-def _run_cancellable(cmd, cancel_token: Optional[CancelToken], on_progress=None):
-    """Run cmd, optionally reporting progress and/or supporting cancellation
-    via cancel_token. Raises CompressionCancelled if the token fires,
-    CalledProcessError on a non-zero exit."""
-    if on_progress is None and cancel_token is None:
-        subprocess.run(cmd, check=True)
-        return
+def _parse_ffmpeg_progress_stream(stdout, on_progress_seconds: Callable[[float], None]):
+    """Read ffmpeg's `-progress pipe:1` key=value stanzas and call
+    on_progress_seconds(elapsed_seconds) once per stanza."""
+    stanza: dict = {}
+    for line in stdout:
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        stanza[key] = value
+        if key != "progress":
+            continue
 
+        elapsed = None
+        out_time = stanza.get("out_time")
+        out_time_ms = stanza.get("out_time_ms")
+        if out_time and out_time != "N/A":
+            try:
+                elapsed = _parse_ffmpeg_timestamp(out_time)
+            except ValueError:
+                pass
+        elif out_time_ms and out_time_ms != "N/A":
+            try:
+                elapsed = int(out_time_ms) / 1_000_000  # microseconds, despite the name
+            except ValueError:
+                pass
+        if elapsed is not None:
+            on_progress_seconds(elapsed)
+        stanza = {}
+
+
+def _run_ffmpeg(
+    cmd,
+    cancel_token: Optional[CancelToken] = None,
+    on_progress_seconds: Optional[Callable[[float], None]] = None,
+):
+    """Run an ffmpeg command. stdout and stderr are kept separate: stdout is
+    only piped when on_progress_seconds is given (ffmpeg's `-progress pipe:1`
+    output), while stderr (ffmpeg's normal human log) is always drained on a
+    background thread into a bounded buffer for error diagnostics only.
+    Raises CompressionCancelled if cancel_token fires, CompressionError
+    (including a tail of stderr) on a non-zero exit."""
+    stdout_target = subprocess.PIPE if on_progress_seconds else subprocess.DEVNULL
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if cancel_token else 0
+
     process = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=stdout_target,
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
         creationflags=creationflags,
     )
+
+    stderr_lines = deque(maxlen=40)
+
+    def _drain_stderr():
+        for line in process.stderr:
+            stderr_lines.append(line.rstrip())
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
     if cancel_token:
         cancel_token.register(process)
     try:
-        for line in process.stdout:
-            if on_progress:
-                match = _PROGRESS_RE.search(line)
-                if match:
-                    on_progress(float(match.group(1)))
+        if on_progress_seconds:
+            _parse_ffmpeg_progress_stream(process.stdout, on_progress_seconds)
         returncode = process.wait()
     finally:
         if cancel_token:
             cancel_token.unregister()
+        stderr_thread.join(timeout=2.0)
 
     if cancel_token and cancel_token.cancelled:
         raise CompressionCancelled()
     if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, cmd)
+        tail = "\n".join(stderr_lines)
+        raise CompressionError(f"ffmpeg exited with code {returncode}:\n{tail}")
 
 
 def merge_audio_tracks(
@@ -219,18 +279,27 @@ def merge_audio_tracks(
     ]
 
     try:
-        _run_cancellable(cmd, cancel_token)
+        _run_ffmpeg(cmd, cancel_token)
     except Exception:
         _safe_remove(mixed_path)
         raise
     return mixed_path
 
 
-def run_handbrake(cmd, on_progress=None, cancel_token: Optional[CancelToken] = None):
-    """Run a HandBrakeCLI command, optionally reporting progress (0-100)
-    via on_progress(percent) as it streams stdout/stderr, and optionally
-    killable mid-run via cancel_token."""
-    _run_cancellable(cmd, cancel_token, on_progress)
+def _build_scale_filter(max_height: Optional[int]) -> Optional[str]:
+    if not max_height:
+        return None
+    # Single quotes here are ffmpeg's own filtergraph escaping (needed
+    # because the "," inside min(ih,N) would otherwise be parsed as a
+    # filter separator) — not shell quoting, so they stay literal even
+    # though Popen(list) bypasses the shell.
+    return f"scale=-2:'min(ih,{max_height})'"
+
+
+def _make_passlog_prefix(output_path: str) -> str:
+    directory = os.path.dirname(output_path) or "."
+    base = os.path.splitext(os.path.basename(output_path))[0]
+    return os.path.join(directory, f".{base}_2pass")
 
 
 def compress(
@@ -249,8 +318,10 @@ def compress(
     """Compress input_path to output_path targeting target_mb.
 
     on_status(str) is called with human-readable stage updates.
-    on_progress(float) is called with HandBrake's 0-100 encode percentage.
+    on_progress(float) is called with the overall 0-100 encode percentage.
     """
+
+    PASS1_WEIGHT = 15  # percent of the bar allotted to pass 1 (analysis)
 
     def status(msg):
         if on_status:
@@ -258,6 +329,7 @@ def compress(
 
     encode_input = input_path
     merged_created = False
+    passlog_prefix = None
     try:
         if merge_audio:
             status("Merging audio tracks...")
@@ -278,37 +350,101 @@ def compress(
             + (f" | Framerate: {framerate}" if framerate else "")
         )
 
-        cmd = [
-            HANDBRAKE_CLI,
+        def progress_for(pass_start, pass_span):
+            def _cb(elapsed_s):
+                if on_progress:
+                    pct = pass_start + min(elapsed_s / duration, 1.0) * pass_span
+                    on_progress(min(pct, pass_start + pass_span))
+
+            return _cb
+
+        vf_string = _build_scale_filter(max_height)
+        passlog_prefix = _make_passlog_prefix(output_path)
+
+        pass1_cmd = [
+            FFMPEG,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-nostats",
             "-i",
             encode_input,
-            "-o",
-            output_path,
-            "--encoder",
-            "x264",
-            "--vb",
-            str(video_kbps),
-            "--multi-pass",
-            "--turbo",
-            "--aencoder",
-            "av_aac",
-            "--ab",
-            str(AUDIO_BITRATE_KBPS),
+            "-c:v",
+            "libx264",
+            "-b:v",
+            f"{video_kbps}k",
+            "-preset",
+            "medium",
         ]
-        if max_height:
-            cmd += ["--maxHeight", str(max_height)]
+        if vf_string:
+            pass1_cmd += ["-vf", vf_string]
         if framerate:
-            cmd += ["--rate", str(framerate), "--pfr"]
+            pass1_cmd += ["-fpsmax", str(framerate)]
+        pass1_cmd += [
+            "-pass",
+            "1",
+            "-passlogfile",
+            passlog_prefix,
+            "-an",
+            "-f",
+            "mp4",
+            os.devnull,
+        ]
 
-        status("Encoding...")
+        pass2_cmd = [
+            FFMPEG,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+            encode_input,
+            "-c:v",
+            "libx264",
+            "-b:v",
+            f"{video_kbps}k",
+            "-preset",
+            "medium",
+        ]
+        if vf_string:
+            pass2_cmd += ["-vf", vf_string]
+        if framerate:
+            pass2_cmd += ["-fpsmax", str(framerate)]
+        pass2_cmd += [
+            "-pass",
+            "2",
+            "-passlogfile",
+            passlog_prefix,
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{AUDIO_BITRATE_KBPS}k",
+            output_path,
+        ]
+
         try:
-            run_handbrake(cmd, on_progress, cancel_token)
+            status("Encoding (pass 1/2)...")
+            _run_ffmpeg(pass1_cmd, cancel_token, progress_for(0, PASS1_WEIGHT))
+
+            if cancel_token and cancel_token.cancelled:
+                raise CompressionCancelled()
+
+            status("Encoding (pass 2/2)...")
+            _run_ffmpeg(
+                pass2_cmd, cancel_token, progress_for(PASS1_WEIGHT, 100 - PASS1_WEIGHT)
+            )
+
+            if on_progress:
+                on_progress(100.0)
         except CompressionCancelled:
             _safe_remove(output_path)
             raise
     finally:
         if merged_created:
             _safe_remove(encode_input)
+        if passlog_prefix:
+            _safe_remove(f"{passlog_prefix}-0.log")
+            _safe_remove(f"{passlog_prefix}-0.log.mbtree")
 
     output_mb = os.path.getsize(output_path) / (1024 * 1024)
     status(f"Done ({output_mb:.2f} MB)")

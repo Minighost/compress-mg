@@ -115,7 +115,7 @@ class MainWindow(QMainWindow):
 
         self.settings = QSettings(str(SETTINGS_FILE), QSettings.IniFormat)
         self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(1)  # one HandBrake encode at a time
+        self.thread_pool.setMaxThreadCount(1)  # one ffmpeg encode at a time
 
         self.queue: list[str] = []
         self.busy = False
